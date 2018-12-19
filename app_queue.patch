@@ -1,0 +1,455 @@
+--- app_queue.c	2018-12-19 18:13:28.030459677 -0200
++++ ayty_app_queue.c	2018-12-19 18:13:28.094459768 -0200
+@@ -69,7 +69,7 @@
+ 
+ #include "asterisk.h"
+ 
+-ASTERISK_FILE_VERSION(__FILE__, "$Revision$")
++ASTERISK_FILE_VERSION(__FILE__, "13.6.0 - Ayty 2.0.1 20171129")
+ 
+ #include <sys/time.h>
+ #include <sys/signal.h>
+@@ -1240,10 +1240,12 @@ enum {
+ 	OPT_CALLER_AUTOMIXMON =      (1 << 16),
+ 	OPT_CALLEE_AUTOMON =         (1 << 17),
+ 	OPT_CALLER_AUTOMON =         (1 << 18),
++	OPT_PREFERENTIAL_CALLED =     (1 << 19),	
+ };
+ 
+ enum {
+ 	OPT_ARG_CALLEE_GO_ON = 0,
++	OPT_ARG_PREFERENTIAL_CALLED = 0,
+ 	/* note: this entry _MUST_ be the last one in the enum */
+ 	OPT_ARG_ARRAY_SIZE
+ };
+@@ -1260,6 +1262,7 @@ AST_APP_OPTIONS(queue_exec_options, BEGI
+ 	AST_APP_OPTION('k', OPT_CALLEE_PARK),
+ 	AST_APP_OPTION('K', OPT_CALLER_PARK),
+ 	AST_APP_OPTION('n', OPT_NO_RETRY),
++	AST_APP_OPTION_ARG('P', OPT_PREFERENTIAL_CALLED, OPT_ARG_PREFERENTIAL_CALLED),
+ 	AST_APP_OPTION('r', OPT_RINGING),
+ 	AST_APP_OPTION('R', OPT_RING_WHEN_RINGING),
+ 	AST_APP_OPTION('t', OPT_CALLEE_TRANSFER),
+@@ -1479,6 +1482,9 @@ struct queue_ent {
+ 	AST_LIST_HEAD_NOLOCK(,penalty_rule) qe_rules; /*!< Local copy of the queue's penalty rules */
+ 	struct penalty_rule *pr;               /*!< Pointer to the next penalty rule to implement */
+ 	struct queue_ent *next;                /*!< The next queue entry */
++	time_t pref_expire;                         /*!< Preferential caller expire */
++	int use_pref;                              /*!< Use Preferential caller */
++	int qt_attemps;                              /*!< Numb of attemps to deliver in  */
+ };
+ 
+ struct member {
+@@ -3576,6 +3582,13 @@ static int join_queue(char *queuename, s
+ 		inserted = 0;
+ 		prev = NULL;
+ 		cur = q->head;
++		
++		
++			
++		
++		
++		
++		
+ 		while (cur) {
+ 			/* We have higher priority than the current user, enter
+ 			 * before him, after all the other users with priority
+@@ -4202,6 +4215,9 @@ static int ring_entry(struct queue_ent *
+ 	const char *macrocontext, *macroexten;
+ 	RAII_VAR(struct ast_json *, blob, NULL, ast_json_unref);
+ 
++
++
++	ast_debug(1, "%s processing \n",tmp->interface);
+ 	/* on entry here, we know that tmp->chan == NULL */
+ 	if (!can_ring_entry(qe, tmp)) {
+ 		tmp->stillgoing = 0;
+@@ -4326,13 +4342,17 @@ static struct callattempt *find_best(str
+ 	struct callattempt *best = NULL, *cur;
+ 
+ 	for (cur = outgoing; cur; cur = cur->q_next) {
++		
+ 		if (cur->stillgoing &&					/* Not already done */
+ 			!cur->chan &&					/* Isn't already going */
+ 			(!best || cur->metric < best->metric)) {		/* We haven't found one yet, or it's better */
++	
+ 			best = cur;
++			
+ 		}
++		
+ 	}
+-
++	
+ 	return best;
+ }
+ 
+@@ -4349,9 +4369,12 @@ static struct callattempt *find_best(str
+ static int ring_one(struct queue_ent *qe, struct callattempt *outgoing, int *busies)
+ {
+ 	int ret = 0;
+-
++	ast_debug(1, "Ring one\n");
+ 	while (ret == 0) {
++		
++		
+ 		struct callattempt *best = find_best(outgoing);
++		//struct callattempt *best = outgoing;
+ 		if (!best) {
+ 			ast_debug(1, "Nobody left to try ringing in queue\n");
+ 			break;
+@@ -4377,6 +4400,14 @@ static int ring_one(struct queue_ent *qe
+ 			ret = 0;
+ 			break;
+ 		}
++		
++		/* If we have timed out, break out */
++		if (qe->use_pref && qe->pref_expire && (time(NULL) >= qe->pref_expire)) {
++			ast_debug(1, "Queue timed out while ringing preferential member.\n");
++			ret = 0;
++			break;
++		}
++		
+ 	}
+ 
+ 	return ret;
+@@ -4635,7 +4666,6 @@ static struct callattempt *wait_for_answ
+ 	ast_channel_lock(qe->chan);
+ 	inchan_name = ast_strdupa(ast_channel_name(qe->chan));
+ 	ast_channel_unlock(qe->chan);
+-
+ 	starttime = (long) time(NULL);
+ #ifdef HAVE_EPOLL
+ 	for (epollo = outgoing; epollo; epollo = epollo->q_next) {
+@@ -4650,7 +4680,6 @@ static struct callattempt *wait_for_answ
+ 		struct ast_channel *watchers[AST_MAX_WATCHERS];
+ 		watchers[0] = in;
+ 		start = NULL;
+-
+ 		for (retry = 0; retry < 2; retry++) {
+ 			numlines = 0;
+ 			for (o = outgoing; o; o = o->q_next) { /* Keep track of important channels */
+@@ -4681,6 +4710,7 @@ static struct callattempt *wait_for_answ
+ 			ring_one(qe, outgoing, &numbusies);
+ 			/* and retry... */
+ 		}
++		
+ 		if (pos == 1 /* not found */) {
+ 			if (numlines == (numbusies + numnochan)) {
+ 				ast_debug(1, "Everyone is busy at this time\n");
+@@ -4693,7 +4723,6 @@ static struct callattempt *wait_for_answ
+ 
+ 		/* Poll for events from both the incoming channel as well as any outgoing channels */
+ 		winner = ast_waitfor_n(watchers, pos, to);
+-
+ 		/* Service all of the outgoing channels */
+ 		for (o = start; o; o = o->call_next) {
+ 			/* We go with a fixed buffer here instead of using ast_strdupa. Using
+@@ -4708,7 +4737,7 @@ static struct callattempt *wait_for_answ
+ 			}
+ 			if (o->stillgoing && (o->chan) &&  (ast_channel_state(o->chan) == AST_STATE_UP)) {
+ 				if (!peer) {
+-					ast_verb(3, "%s answered %s\n", ochan_name, inchan_name);
++					ast_verb(3, "%s answered 1  %s\n", ochan_name, inchan_name);
+ 					if (o->orig_chan_name
+ 						&& strcmp(o->orig_chan_name, ochan_name)) {
+ 						/*
+@@ -4737,7 +4766,6 @@ static struct callattempt *wait_for_answ
+ 					peer = o;
+ 				}
+ 			} else if (o->chan && (o->chan == winner)) {
+-
+ 				ast_copy_string(on, o->member->interface, sizeof(on));
+ 				ast_copy_string(membername, o->member->membername, sizeof(membername));
+ 
+@@ -4879,7 +4907,7 @@ static struct callattempt *wait_for_answ
+ 						case AST_CONTROL_ANSWER:
+ 							/* This is our guy if someone answered. */
+ 							if (!peer) {
+-								ast_verb(3, "%s answered %s\n", ochan_name, inchan_name);
++								ast_verb(3, "%s answered 2 %s\n", ochan_name, inchan_name);
+ 								ast_channel_publish_dial(qe->chan, o->chan, on, "ANSWER");
+ 								publish_dial_end_event(qe->chan, outgoing, o->chan, "CANCEL");
+ 								if (o->orig_chan_name
+@@ -5141,7 +5169,6 @@ skip_frame:;
+ 		}
+ 	}
+ #endif
+-
+ 	return peer;
+ }
+ 
+@@ -5165,11 +5192,21 @@ static int is_our_turn(struct queue_ent 
+ 	/* This needs a lock. How many members are available to be served? */
+ 	ao2_lock(qe->parent);
+ 
++	ast_debug (1,"Is our turn begin, %d posit and use_pref %d\n",qe->pos,qe->use_pref);
++	if (qe->pos == 1 && !(qe->use_pref)){
++		qe->qt_attemps++;
++		ast_debug (1,"Is our guy with attmeps %d\n",qe->qt_attemps);
++		if(qe->qt_attemps % 5 == 0){
++			if ((qe->parent = find_load_queue_rt_friendly(qe->parent->name))) {
++				ast_debug (1,"Reloaded queue member\n");
++			}
++		}
++	}
+ 	avl = num_available_members(qe->parent);
+ 
+ 	ch = qe->parent->head;
+ 
+-	ast_debug(1, "There %s %d available %s.\n", avl != 1 ? "are" : "is", avl, avl != 1 ? "members" : "member");
++	ast_debug(1, "There %s %d available %s and position %d.\n", avl != 1 ? "are" : "is", avl, avl != 1 ? "members" : "member",qe->pos);
+ 
+ 	while ((idx < avl) && (ch) && (ch != qe)) {
+ 		if (!ch->pending) {
+@@ -5178,6 +5215,9 @@ static int is_our_turn(struct queue_ent 
+ 		ch = ch->next;
+ 	}
+ 
++	
++
++
+ 	ao2_unlock(qe->parent);
+ 	/* If the queue entry is within avl [the number of available members] calls from the top ...
+ 	 * Autofill and position check added to support autofill=no (as only calls
+@@ -5270,7 +5310,9 @@ static int wait_our_turn(struct queue_en
+ 
+ 	/* This is the holding pen for callers 2 through maxlen */
+ 	for (;;) {
+-
++		
++		
++		
+ 		if (is_our_turn(qe)) {
+ 			break;
+ 		}
+@@ -6317,12 +6359,13 @@ static void setup_mixmonitor(struct queu
+  */
+ static int try_calling(struct queue_ent *qe, struct ast_flags opts, char **opt_args, char *announceoverride, const char *url, int *tries, int *noption, const char *agi, const char *macro, const char *gosub, int ringing)
+ {
+-	struct member *cur;
++	struct member *cur , *cur_p;
+ 	struct callattempt *outgoing = NULL; /* the list of calls we are building */
+ 	int to, orig;
+ 	char oldexten[AST_MAX_EXTENSION]="";
+ 	char oldcontext[AST_MAX_CONTEXT]="";
+ 	char queuename[256]="";
++	char preferInterfaceName[256]="";
+ 	char interfacevar[256]="";
+ 	struct ast_channel *peer;
+ 	struct ast_channel *which;
+@@ -6349,10 +6392,52 @@ static int try_calling(struct queue_ent 
+ 	struct ao2_iterator memi;
+ 	struct queue_end_bridge *queue_end_bridge = NULL;
+ 
++	outgoing = NULL;
++
++	if (qe->use_pref) {
++		ast_copy_string(queuename, qe->parent->name, sizeof(queuename));
++		ast_copy_string(preferInterfaceName, opt_args[OPT_ARG_PREFERENTIAL_CALLED], sizeof(preferInterfaceName));
++		ast_debug(1, "%s Try Calling. in %s to %s \n",ast_channel_name(qe->chan),qe->parent->name,preferInterfaceName);
++		cur_p = find_member_by_queuename_and_interface(queuename, preferInterfaceName);
++		if (!cur_p || ast_strlen_zero(cur_p->membername)) {
++			ast_debug(1, "%s Not Try Calling.\n",ast_channel_name(qe->chan));
++			goto out;
++		}else{
++	
++			ast_debug(1, "%s  Percorrendo a interface Preferencial.\n",cur_p->interface);
++		
++			struct callattempt *tmp_p = ast_calloc(1, sizeof(*tmp_p));
++			if (!tmp_p) {
++				ao2_ref(cur_p, -1);
++				ao2_iterator_destroy(&memi);
++				ao2_unlock(qe->parent);
++				goto out;
++			}
++	
++	
++			ast_channel_lock(qe->chan);
++			ast_party_connected_line_copy(&tmp_p->connected, ast_channel_connected(qe->chan));
++			ast_channel_unlock(qe->chan);
++	
++			tmp_p->block_connected_update = block_connected_line;
++			tmp_p->stillgoing = 1;
++			tmp_p->member = cur_p;/* Place the reference for cur into callattempt. */
++			tmp_p->lastcall = cur_p->lastcall;
++			tmp_p->lastqueue = cur_p->lastqueue;
++		
++			ast_copy_string(tmp_p->interface, cur_p->interface, sizeof(tmp_p->interface));
++			outgoing = tmp_p;
++			qe->pref_expire=3;
++		}
++		
++	}
++
+ 	memset(&bridge_config, 0, sizeof(bridge_config));
+ 	tmpid[0] = 0;
+ 	time(&now);
+ 
++
++
+ 	/* If we've already exceeded our timeout, then just stop
+ 	 * This should be extremely rare. queue_exec will take care
+ 	 * of removing the caller and reporting the timeout as the reason.
+@@ -6414,6 +6499,11 @@ static int try_calling(struct queue_ent 
+ 		qe->cancel_answered_elsewhere = 1;
+ 	}
+ 
++	if (qe->use_pref) {
++		goto jump_pref_agent;
++	}
++
++
+ 	/* if the calling channel has AST_CAUSE_ANSWERED_ELSEWHERE set, make sure this is inherited.
+ 		(this is mainly to support unreal/local channels)
+ 	*/
+@@ -6434,6 +6524,7 @@ static int try_calling(struct queue_ent 
+ 
+ 	memi = ao2_iterator_init(qe->parent->members, 0);
+ 	while ((cur = ao2_iterator_next(&memi))) {
++		
+ 		struct callattempt *tmp = ast_calloc(1, sizeof(*tmp));
+ 		if (!tmp) {
+ 			ao2_ref(cur, -1);
+@@ -6472,9 +6563,12 @@ static int try_calling(struct queue_ent 
+ 		} else {
+ 			callattempt_free(tmp);
+ 		}
++		
++		
+ 	}
+ 	ao2_iterator_destroy(&memi);
+ 
++
+ 	if (qe->parent->timeoutpriority == TIMEOUT_PRIORITY_APP) {
+ 		/* Application arguments have higher timeout priority (behaviour for <=1.6) */
+ 		if (qe->expire && (!qe->parent->timeout || (qe->expire - now) <= qe->parent->timeout)) {
+@@ -6492,14 +6586,17 @@ static int try_calling(struct queue_ent 
+ 			to = -1;
+ 		}
+ 	}
++	
++	
++jump_pref_agent:	
+ 	orig = to;
+ 	++qe->pending;
+ 	ao2_unlock(qe->parent);
+ 	ring_one(qe, outgoing, &numbusies);
+-	lpeer = wait_for_answer(qe, outgoing, &to, &digit, numbusies,
+-		ast_test_flag(&(bridge_config.features_caller), AST_FEATURE_DISCONNECT),
+-		forwardsallowed, ringing);
+ 
++	lpeer = wait_for_answer(qe, outgoing, &to, &digit, numbusies,
++	ast_test_flag(&(bridge_config.features_caller), AST_FEATURE_DISCONNECT),
++	forwardsallowed, ringing);
+ 	ast_channel_unlock(qe->chan);
+ 	ao2_lock(qe->parent);
+ 	if (qe->parent->strategy == QUEUE_STRATEGY_RRMEMORY || qe->parent->strategy == QUEUE_STRATEGY_RRORDERED) {
+@@ -6524,6 +6621,7 @@ static int try_calling(struct queue_ent 
+ 			ast_debug(1, "%s: Nobody answered.\n", ast_channel_name(qe->chan));
+ 		}
+ 	} else { /* peer is valid */
++	
+ 		RAII_VAR(struct ast_json *, blob, NULL, ast_json_unref);
+ 		/* Ah ha!  Someone answered within the desired timeframe.  Of course after this
+ 		   we will always return with -1 so that it is hung up properly after the
+@@ -6658,19 +6756,16 @@ static int try_calling(struct queue_ent 
+ 		/* try to set queue variables if configured to do so*/
+ 		set_queue_variables(qe->parent, qe->chan);
+ 		set_queue_variables(qe->parent, peer);
+-
+ 		setup_peer_after_bridge_goto(qe->chan, peer, &opts, opt_args);
+ 		ast_channel_lock(qe->chan);
+ 		if ((monitorfilename = pbx_builtin_getvar_helper(qe->chan, "MONITOR_FILENAME"))) {
+ 				monitorfilename = ast_strdupa(monitorfilename);
+ 		}
+ 		ast_channel_unlock(qe->chan);
+-
+ 		/* Begin Monitoring */
+ 		if (*qe->parent->monfmt) {
+ 			if (!qe->parent->montype) {
+ 				const char *monexec;
+-				ast_debug(1, "Starting Monitor as requested.\n");
+ 				ast_channel_lock(qe->chan);
+ 				if ((monexec = pbx_builtin_getvar_helper(qe->chan, "MONITOR_EXEC")) || pbx_builtin_getvar_helper(qe->chan, "MONITOR_EXEC_ARGS")) {
+ 					which = qe->chan;
+@@ -7829,6 +7924,9 @@ static int queue_exec(struct ast_channel
+ 	if (ast_test_flag(&opts, OPT_GO_ON)) {
+ 		qcontinue = 1;
+ 	}
++	
++
++	
+ 
+ 	if (args.position) {
+ 		position = atoi(args.position);
+@@ -7850,6 +7948,59 @@ static int queue_exec(struct ast_channel
+ 	qe.last_periodic_announce_time = time(NULL);
+ 	qe.last_periodic_announce_sound = 0;
+ 	qe.valid_digits = 0;
++	
++	if (ast_test_flag(&opts, OPT_PREFERENTIAL_CALLED)) {
++			qe.use_pref = 1;
++			ast_log(LOG_NOTICE, "Has preferential Called defined to %s.\n",ast_channel_name(chan));
++			/* Ring just the best channel */
++			struct queue_ent* cp_qe = &qe;
++			
++			// qe->parent->members
++			
++			// ao2_link(queue->members, mem);
++			
++			//qe->parent->members =  create_queue_member("Local/000002@agent_call_v4/nj", "Local/000002@agent_call_v4/nj", 1, 1, "Local/000002@agent_call_v4/nj", 0);
++			/* Try calling all queue members for 'timeout' seconds */
++			
++						struct call_queue *q;
++						int res = -1;
++					
++						if (!(q = find_load_queue_rt_friendly(args.queuename))) {
++							return res;
++						}
++						ao2_lock(q);
++							
++							
++								
++							
++							cp_qe->parent = q;
++						
++							
++							
++							
++							ast_copy_string(cp_qe->moh, q->moh, sizeof(cp_qe->moh));
++							ast_copy_string(cp_qe->announce, q->announce, sizeof(cp_qe->announce));
++							ast_copy_string(cp_qe->context, q->context, sizeof(cp_qe->context));
++							
++							
++													
++							ao2_unlock(q);
++		
++		
++			
++			res = try_calling(cp_qe, opts, opt_args, args.announceoverride, args.url, &tries, &noption, args.agi, args.macro, args.gosub, ringing);
++			if (res) {
++					ast_log(LOG_NOTICE, "Has preferential Called Used to %s.\n",ast_channel_name(chan));
++				goto stop;
++			}else {
++				qe.use_pref = 0;
++				 ast_log(LOG_NOTICE, "The Called target can't be located to %s returning to queue with default settings.\n",ast_channel_name(chan));
++			}
++			
++			
++
++	}
++	
+ 	if (join_queue(args.queuename, &qe, &reason, position)) {
+ 		ast_log(LOG_WARNING, "Unable to join queue '%s'\n", args.queuename);
+ 		set_queue_result(chan, reason);
+@@ -7863,6 +8014,10 @@ static int queue_exec(struct ast_channel
+ 		qe.opos);
+ 	copy_rules(&qe, args.rule);
+ 	qe.pr = AST_LIST_FIRST(&qe.qe_rules);
++	
++
++	
++	
+ check_turns:
+ 	if (ringing) {
+ 		ast_indicate(chan, AST_CONTROL_RINGING);
